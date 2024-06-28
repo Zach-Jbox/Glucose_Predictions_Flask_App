@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
 import sqlite3
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
@@ -14,6 +14,9 @@ import numpy as np
 import os
 import joblib
 from pydexcom import Dexcom
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 app = Flask(__name__)
 
@@ -123,13 +126,15 @@ def update_rf_predictions():
 
         df['hour'] = df['hour'].astype(int)
         df['minute'] = df['minute'].astype(int)
+
+        # Log data for debugging
+        print("Training data for Random Forest:")
+        print(df.tail())
+
         model_path = 'random_forest_model.pkl'
-        if not os.path.exists(model_path):
-            rf_model = RandomForestRegressor(n_estimators=100, random_state=0)
-            rf_model.fit(df[['hour', 'minute']], df['glucose_level'])
-            joblib.dump(rf_model, model_path)
-        else:
-            rf_model = joblib.load(model_path)
+        rf_model = RandomForestRegressor(n_estimators=100, random_state=0)
+        rf_model.fit(df[['hour', 'minute']], df['glucose_level'])
+        joblib.dump(rf_model, model_path)
 
         next_hour = (df['hour'].iloc[-1] + (df['minute'].iloc[-1] + 30) // 60) % 24
         next_minute = (df['minute'].iloc[-1] + 30) % 60
@@ -137,6 +142,7 @@ def update_rf_predictions():
         prediction = rf_model.predict(next_data_point)
         rounded_prediction = int(round(prediction[0]))
         save_prediction("RF_PREDICTIONS", next_hour, next_minute, rounded_prediction)
+        print(f"RF prediction: {rounded_prediction} for time {next_hour}:{next_minute}")
         time.sleep(300)  # Update every 5 minutes
 
 # Function to update XGBoost predictions
@@ -153,14 +159,16 @@ def update_xgb_predictions():
 
         df['hour'] = df['hour'].astype(int)
         df['minute'] = df['minute'].astype(int)
+
+        # Log data for debugging
+        print("Training data for XGBoost:")
+        print(df.tail())
+
         model_path = 'xgboost_model.pkl'
-        if not os.path.exists(model_path):
-            X_train, X_test, y_train, y_test = train_test_split(df[['hour', 'minute']], df['glucose_level'], test_size=0.2, random_state=42)
-            model = xgb.XGBRegressor()
-            model.fit(X_train, y_train)
-            joblib.dump(model, model_path)
-        else:
-            model = joblib.load(model_path)
+        X_train, X_test, y_train, y_test = train_test_split(df[['hour', 'minute']], df['glucose_level'], test_size=0.2, random_state=42)
+        model = xgb.XGBRegressor()
+        model.fit(X_train, y_train)
+        joblib.dump(model, model_path)
 
         next_hour = (df['hour'].iloc[-1] + (df['minute'].iloc[-1] + 30) // 60) % 24
         next_minute = (df['minute'].iloc[-1] + 30) % 60
@@ -168,6 +176,7 @@ def update_xgb_predictions():
         prediction = model.predict(next_data_point)
         rounded_prediction = int(round(prediction[0]))
         save_prediction("XGB_PREDICTIONS", next_hour, next_minute, rounded_prediction)
+        print(f"XGB prediction: {rounded_prediction} for time {next_hour}:{next_minute}")
         time.sleep(300)  # Update every 5 minutes
 
 # Function to update LSTM predictions
@@ -218,21 +227,64 @@ def update_lstm_predictions():
         save_prediction("LSTM_PREDICTIONS", next_hour, next_minute, rounded_prediction)
         time.sleep(300)  # Update every 5 minutes
 
-# Start background threads for prediction updates
+# Fetch data from SQLite database
+def fetch_data():
+    conn = sqlite3.connect('glucose.db')
+    glucose_readings = pd.read_sql_query("SELECT * FROM GLUCOSE_READINGS ORDER BY id ASC", conn)
+    rf_predictions = pd.read_sql_query("SELECT * FROM RF_PREDICTIONS ORDER BY id ASC", conn)
+    xgb_predictions = pd.read_sql_query("SELECT * FROM XGB_PREDICTIONS ORDER BY id ASC", conn)
+    lstm_predictions = pd.read_sql_query("SELECT * FROM LSTM_PREDICTIONS ORDER BY id ASC", conn)
+    conn.close()
+    return glucose_readings, rf_predictions, xgb_predictions, lstm_predictions
+
+# Align predictions with actual values
+def align_predictions(glucose_readings, predictions):
+    aligned_data = pd.DataFrame()
+    aligned_data['actual'] = glucose_readings['glucose_level'].shift(-1)  # Shift to align actuals with predictions
+    aligned_data['predicted'] = predictions['prediction']
+    aligned_data.dropna(inplace=True)
+    return aligned_data
+
+# Generate and save line graphs
+def generate_and_save_graphs():
+    while True:
+        glucose_readings, rf_predictions, xgb_predictions, lstm_predictions = fetch_data()
+        
+        rf_data = align_predictions(glucose_readings, rf_predictions)
+        xgb_data = align_predictions(glucose_readings, xgb_predictions)
+        lstm_data = align_predictions(glucose_readings, lstm_predictions)
+
+        for model, data in zip(['rf', 'xgb', 'lstm'], [rf_data, xgb_data, lstm_data]):
+            plt.figure()
+            plt.plot(data.index, data['actual'], label='Actual')
+            plt.plot(data.index, data['predicted'], label='Predicted')
+            plt.title(f'{model.upper()} Predictions vs Actual')
+            plt.xlabel('Time')
+            plt.ylabel('Glucose Level')
+            plt.legend()
+            plt.savefig(f'{model}_predictions_vs_actual.png')
+            plt.close()
+        
+        time.sleep(300)  # Update every 5 minutes
+
+# Start background threads for prediction updates and graph generation
 rf_thread = threading.Thread(target=update_rf_predictions)
 xgb_thread = threading.Thread(target=update_xgb_predictions)
 lstm_thread = threading.Thread(target=update_lstm_predictions)
 update_thread = threading.Thread(target=update_glucose_readings)
+graph_thread = threading.Thread(target=generate_and_save_graphs)
 
 rf_thread.daemon = True
 xgb_thread.daemon = True
 lstm_thread.daemon = True
 update_thread.daemon = True
+graph_thread.daemon = True
 
 rf_thread.start()
 xgb_thread.start()
 lstm_thread.start()
 update_thread.start()
+graph_thread.start()
 
 # Flask routes for retrieving the latest predictions
 @app.route('/predict_random_forest', methods=['GET'])
@@ -270,6 +322,40 @@ def predict_lstm():
 
     latest_prediction = df.iloc[0]
     return jsonify({'predicted_glucose_2hours': latest_prediction['prediction']})
+
+# Flask route for serving graphs
+@app.route('/graph/<model>', methods=['GET'])
+def get_graph(model):
+    valid_models = ['rf', 'xgb', 'lstm']
+    if model in valid_models:
+        file_path = f'{model}_predictions_vs_actual.png'
+        if os.path.exists(file_path):
+            return send_file(file_path, mimetype='image/png')
+        else:
+            return jsonify({'error': 'Graph not found'}), 404
+    else:
+        return jsonify({'error': 'Invalid model'}), 400
+
+# Flask route for fetching current glucose level and status
+@app.route('/current_glucose', methods=['GET'])
+def current_glucose():
+    conn = sqlite3.connect('glucose.db')
+    df = pd.read_sql_query("SELECT * FROM GLUCOSE_READINGS ORDER BY id DESC LIMIT 1", conn)
+    conn.close()
+
+    if df.empty:
+        return jsonify({'error': 'No glucose readings available'})
+
+    latest_reading = df.iloc[0]
+    glucose_level = latest_reading['glucose_level']
+    status = 'Normal'
+
+    if glucose_level < 70:
+        status = 'Low'
+    elif glucose_level > 180:
+        status = 'High'
+
+    return jsonify({'glucose_level': glucose_level, 'status': status})
 
 if __name__ == "__main__":
     app.run(debug=False, port=5000)
