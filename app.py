@@ -4,10 +4,10 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from keras.models import Sequential, load_model
-from keras.layers import LSTM, Dense
+from tensorflow.keras.models import Sequential, load_model, model_from_json
+from tensorflow.keras.layers import LSTM, Dense
 import xgboost as xgb
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import threading
 import numpy as np
@@ -112,6 +112,51 @@ def create_dataset(X, y, time_steps=1, future_steps=1):
         ys.append(y[i + time_steps + future_steps - 1])
     return np.array(Xs), np.array(ys)
 
+# Function to create and save the LSTM model
+def create_and_save_lstm_model():
+    conn = sqlite3.connect('glucose.db')
+    df = pd.read_sql_query("SELECT * FROM GLUCOSE_READINGS", conn)
+    conn.close()
+
+    if df.empty:
+        print("No data available to create the LSTM model")
+        return
+
+    scaler = MinMaxScaler()
+    data_scaled = scaler.fit_transform(df[['glucose_level']])
+    time_steps = 10
+    future_steps_2hours = 24
+
+    X_2hours, y_2hours = create_dataset(data_scaled, data_scaled, time_steps, future_steps_2hours)
+    if X_2hours.size == 0 or y_2hours.size == 0:
+        print("Not enough data to create the LSTM dataset")
+        return
+
+    model_path = 'lstm_model_2hours.h5'
+    model_json_path = 'lstm_model_2hours.json'
+    X_train_2hours, X_test_2hours, y_train_2hours, y_test_2hours = train_test_split(X_2hours, y_2hours, test_size=0.2, shuffle=False)
+    model_2hours = Sequential()
+    model_2hours.add(LSTM(units=64, input_shape=(X_train_2hours.shape[1], X_train_2hours.shape[2]), time_major=False))
+    model_2hours.add(Dense(units=1))
+    model_2hours.compile(optimizer='adam', loss='mean_squared_error')
+    model_2hours.fit(X_train_2hours, y_train_2hours, epochs=100, batch_size=32, validation_split=0.2)
+    model_2hours.save(model_path)
+    
+    # Save model configuration
+    with open(model_json_path, 'w') as json_file:
+        json_file.write(model_2hours.to_json())
+    
+    print(f"LSTM model saved to {model_path} and configuration saved to {model_json_path}")
+
+# Function to load the LSTM model with `time_major` argument
+def load_lstm_model(model_path, model_json_path):
+    with open(model_json_path, 'r') as json_file:
+        model_json = json_file.read()
+    
+    model_2hours = model_from_json(model_json, custom_objects={'LSTM': LSTM})
+    model_2hours.load_weights(model_path)
+    return model_2hours
+
 # Function to update Random Forest predictions
 def update_rf_predictions():
     while True:
@@ -203,16 +248,12 @@ def update_lstm_predictions():
             continue
 
         model_path = 'lstm_model_2hours.h5'
-        if not os.path.exists(model_path):
-            X_train_2hours, X_test_2hours, y_train_2hours, y_test_2hours = train_test_split(X_2hours, y_2hours, test_size=0.2, shuffle=False)
-            model_2hours = Sequential()
-            model_2hours.add(LSTM(units=64, input_shape=(X_train_2hours.shape[1], X_train_2hours.shape[2])))
-            model_2hours.add(Dense(units=1))
-            model_2hours.compile(optimizer='adam', loss='mean_squared_error')
-            model_2hours.fit(X_train_2hours, y_train_2hours, epochs=100, batch_size=32, validation_split=0.2)
-            model_2hours.save(model_path)
-        else:
-            model_2hours = load_model(model_path)
+        model_json_path = 'lstm_model_2hours.json'
+        if not os.path.exists(model_path) or not os.path.exists(model_json_path):
+            print(f"LSTM model file not found: {model_path}")
+            create_and_save_lstm_model()
+        
+        model_2hours = load_lstm_model(model_path, model_json_path)
 
         X_pred_2hours = np.array([data_scaled[-time_steps:]])
         y_pred_2hours = model_2hours.predict(X_pred_2hours)
@@ -227,64 +268,21 @@ def update_lstm_predictions():
         save_prediction("LSTM_PREDICTIONS", next_hour, next_minute, rounded_prediction)
         time.sleep(300)  # Update every 5 minutes
 
-# Fetch data from SQLite database
-def fetch_data():
-    conn = sqlite3.connect('glucose.db')
-    glucose_readings = pd.read_sql_query("SELECT * FROM GLUCOSE_READINGS ORDER BY id ASC", conn)
-    rf_predictions = pd.read_sql_query("SELECT * FROM RF_PREDICTIONS ORDER BY id ASC", conn)
-    xgb_predictions = pd.read_sql_query("SELECT * FROM XGB_PREDICTIONS ORDER BY id ASC", conn)
-    lstm_predictions = pd.read_sql_query("SELECT * FROM LSTM_PREDICTIONS ORDER BY id ASC", conn)
-    conn.close()
-    return glucose_readings, rf_predictions, xgb_predictions, lstm_predictions
-
-# Align predictions with actual values
-def align_predictions(glucose_readings, predictions):
-    aligned_data = pd.DataFrame()
-    aligned_data['actual'] = glucose_readings['glucose_level'].shift(-1)  # Shift to align actuals with predictions
-    aligned_data['predicted'] = predictions['prediction']
-    aligned_data.dropna(inplace=True)
-    return aligned_data
-
-# Generate and save line graphs
-def generate_and_save_graphs():
-    while True:
-        glucose_readings, rf_predictions, xgb_predictions, lstm_predictions = fetch_data()
-        
-        rf_data = align_predictions(glucose_readings, rf_predictions)
-        xgb_data = align_predictions(glucose_readings, xgb_predictions)
-        lstm_data = align_predictions(glucose_readings, lstm_predictions)
-
-        for model, data in zip(['rf', 'xgb', 'lstm'], [rf_data, xgb_data, lstm_data]):
-            plt.figure()
-            plt.plot(data.index, data['actual'], label='Actual')
-            plt.plot(data.index, data['predicted'], label='Predicted')
-            plt.title(f'{model.upper()} Predictions vs Actual')
-            plt.xlabel('Time')
-            plt.ylabel('Glucose Level')
-            plt.legend()
-            plt.savefig(f'{model}_predictions_vs_actual.png')
-            plt.close()
-        
-        time.sleep(300)  # Update every 5 minutes
-
-# Start background threads for prediction updates and graph generation
+# Start background threads for prediction updates
 rf_thread = threading.Thread(target=update_rf_predictions)
 xgb_thread = threading.Thread(target=update_xgb_predictions)
 lstm_thread = threading.Thread(target=update_lstm_predictions)
 update_thread = threading.Thread(target=update_glucose_readings)
-graph_thread = threading.Thread(target=generate_and_save_graphs)
 
 rf_thread.daemon = True
 xgb_thread.daemon = True
 lstm_thread.daemon = True
 update_thread.daemon = True
-graph_thread.daemon = True
 
 rf_thread.start()
 xgb_thread.start()
 lstm_thread.start()
 update_thread.start()
-graph_thread.start()
 
 # Flask routes for retrieving the latest predictions
 @app.route('/predict_random_forest', methods=['GET'])
@@ -350,10 +348,10 @@ def current_glucose():
     glucose_level = latest_reading['glucose_level']
     status = 'Normal'
 
-    if glucose_level < 70:
-        status = 'Low'
-    elif glucose_level > 180:
-        status = 'High'
+    if glucose_level < 75:
+        status == 'Low'
+    elif glucose_level > 150:
+        status == 'High'
 
     return jsonify({'glucose_level': glucose_level, 'status': status})
 
