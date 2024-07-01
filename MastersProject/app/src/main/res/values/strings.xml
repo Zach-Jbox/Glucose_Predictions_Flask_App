@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">MastersProject</string>
+    <string name="back_to_home">Back to Home</string>
+    <string name="prediction_will_be_shown_here">Prediction will be shown here</string>
+</resources>
